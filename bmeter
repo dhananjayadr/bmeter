@@ -1,0 +1,175 @@
+#!/bin/bash
+
+#paths
+BMETER_DIR="$HOME/bmeter"
+
+#ensure BMETER_DIR exists
+mkdir -p "$BMETER_DIR"
+
+#update LOCAL_DB
+LOCAL_DB="$BMETER_DIR/plugins.json"
+REMOTE_REPO_URL="https://jmeter-plugins.org/repo/"
+
+# get JMeter version
+jmeter_version=$(jmeter -v 2>&1 | grep -o '[0-9]\+\.[0-9]\+\.[0-9]\+')
+
+# define JMeter directories with version
+JMETER_LIB_DIR="/opt/homebrew/Cellar/jmeter/${jmeter_version}/libexec/lib"
+JMETER_EXT_DIR="/opt/homebrew/Cellar/jmeter/${jmeter_version}/libexec/lib/ext"
+
+
+#colors
+GREEN='\033[0;32m'
+RED='\033[0;31m'
+YELLOW='\033[0;33m'
+NC='\033[0m'
+
+# check if LOCAL_DB file exists
+db() {
+    if [ ! -f "$LOCAL_DB" ]; then
+        echo -e "${RED}Error: LOCAL_DB file is missing. Please run plugin manager with {-y|--sync}${NC}"
+        exit 1
+    fi
+}
+
+#function to check if JMeter is installed
+check() {
+    command -v jmeter &> /dev/null || { echo -e "${RED}Error: JMeter is not installed.${NC}"; exit 1; }
+}
+
+#function to sync with remote repository
+sync() {
+    curl -s "$REMOTE_REPO_URL" | jq '.' > "$LOCAL_DB"
+    echo -e "${GREEN}Local database updated with remote plugin information.${NC}"
+}
+
+
+#function to install a plugin
+install() {
+    check
+    db
+
+    local plugin_name="$1"
+    local plugin_version="$2"
+    local json_file="$LOCAL_DB"
+    local downloadUrl
+    local firstLibValue
+
+    if [ -z "$plugin_version" ]; then
+        highest_version=$(jq -r --arg name "$plugin_name" '.[] | select(.name == $name) | .versions | to_entries | sort_by(.key) | .[-1].value | { downloadUrl: .downloadUrl, firstLibValue: (.libs | to_entries | .[0].value), depends: .depends }' "$json_file")
+        plugin_version="$highest_version"
+    fi
+
+    downloadUrl=$(echo "$plugin_version" | jq -r '.downloadUrl')
+    firstLibValue=$(echo "$plugin_version" | jq -r '.firstLibValue')
+
+    echo -e "\nDownloading $plugin_name...\n"
+    download_file() {
+        local url=$1
+        local dir=$2
+        local file_name=$(basename "$url")
+        if ! [[ " ${downloaded_files[@]} " =~ " ${file_name} " ]]; then
+            echo -n "Downloading $file_name... "
+            wget -q --directory-prefix="$dir" -O "$dir/$file_name" "$url" &
+            local pid=$!
+            local spin='-\|/'
+            local charcount=0
+            while ps -p $pid > /dev/null; do
+                printf "\b${spin:$charcount:1}"
+                charcount=$(( (charcount+1) % 4 ))
+                sleep 0.1
+            done
+            wait $pid
+            if [ $? -eq 0 ]; then
+                echo "download complete."
+                downloaded_files+=("$file_name")
+            else
+                echo "failed to download."
+            fi
+        fi
+    }
+
+    if [ -n "$downloadUrl" ]; then
+        download_file "$downloadUrl" "$JMETER_EXT_DIR"
+    else
+        echo "download URL not found."
+    fi
+
+    if [ -n "$firstLibValue" ]; then
+        download_file "$firstLibValue" "$JMETER_LIB_DIR"
+    else
+        echo "library value URL not found."
+    fi
+}
+
+#function to remove a plugin
+remove() {
+    echo -e "${GREEN}Plugin $plugin_name removed successfully.${NC}"
+}
+
+#function to list plugins from a JSON file
+list() {
+    local json_file="$LOCAL_DB"
+
+    db
+
+    jq -r '.[].name' "$json_file" | column
+}
+
+#function to get info about a plugin from a JSON file
+info() {
+    local plugin_name="$1"
+    local json_file="$LOCAL_DB"
+
+    db
+
+    if ! grep -q "\"name\": \"$plugin_name\"" "$json_file"; then
+        echo -e "${YELLOW}Warning: No available plugin with the name \"$plugin_name\".${NC}"
+        exit 1
+    fi
+
+    jq -r --arg name "$plugin_name" '.[] | select(.name == $name) | .description' "$json_file"
+}
+
+#restart JMeter
+restart() {
+    echo "Stopping JMeter..."
+    jmeter_pid=$(pgrep -f "jmeter")
+    if [ -n "$jmeter_pid" ]; then
+        kill "$jmeter_pid"
+        echo "JMeter stopped."
+    else
+        echo "JMeter is not running."
+    fi
+
+    echo "Starting JMeter..."
+    jmeter &
+    echo "JMeter started."
+}
+
+case "$1" in
+    -s|--install)
+        install "$2" "$3"
+        ;;
+    -r|--remove)
+        remove "$2"
+        ;;
+    -i|--info)
+        info "$2"
+        ;;
+    -l|--list)
+        list
+        ;;
+    -y|--sync)
+        sync
+        ;;
+    -R|--restart)
+        restart
+        ;;
+    *)
+        echo -e "${YELLOW}Usage: $0 {-s|--install} [plugin_name] [plugin_version] | {-r|--remove} [plugin_name] | {-l|--list} | {-y|--sync}${NC}"
+        exit 1
+        ;;
+esac
+
+exit 0
